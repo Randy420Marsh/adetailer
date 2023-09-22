@@ -434,7 +434,8 @@ class AfterDetailerScript(scripts.Script):
             do_not_save_grid=True,
             override_settings=override_settings,
         )
-
+        
+        i2i._ad_idx = p._ad_idx
         i2i.cached_c = [None, None]
         i2i.cached_uc = [None, None]
         i2i.scripts, i2i.script_args = self.script_filter(p, args)
