@@ -1,24 +1,34 @@
 from __future__ import annotations
 
-import os
 import platform
 import re
 import sys
 import traceback
-from contextlib import contextmanager, suppress
-from copy import copy, deepcopy
+from copy import copy
 from functools import partial
 from pathlib import Path
 from textwrap import dedent
-from typing import Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 import gradio as gr
-import torch
-from PIL import Image
+from PIL import Image, ImageChops
 from rich import print
-from torchvision.transforms.functional import to_pil_image
 
 import modules
+from aaaaaa.conditional import create_binary_mask, schedulers
+from aaaaaa.helper import (
+    change_torch_load,
+    copy_extra_params,
+    pause_total_tqdm,
+    preseve_prompts,
+)
+from aaaaaa.p_method import (
+    get_i,
+    is_img2img_inpaint,
+    is_inpaint_only_masked,
+    need_call_postprocess,
+    need_call_process,
+)
 from adetailer import (
     AFTER_DETAILER,
     __version__,
@@ -26,24 +36,28 @@ from adetailer import (
     mediapipe_predict,
     ultralytics_predict,
 )
-from adetailer.args import ALL_ARGS, BBOX_SORTBY, ADetailerArgs
-from adetailer.common import PredictOutput
+from adetailer.args import BBOX_SORTBY, SCRIPT_DEFAULT, ADetailerArgs, SkipImg2ImgOrig
+from adetailer.common import PredictOutput, ensure_pil_image, safe_mkdir
 from adetailer.mask import (
     filter_by_ratio,
     filter_k_largest,
+    has_intersection,
+    is_all_black,
     mask_preprocess,
     sort_bboxes,
 )
 from adetailer.traceback import rich_traceback
 from adetailer.ui import WebuiInfo, adui, ordinal, suffix
-from controlnet_ext import ControlNetExt, controlnet_exists, get_cn_models
-from controlnet_ext.restore import (
+from controlnet_ext import (
     CNHijackRestore,
+    ControlNetExt,
     cn_allow_script_control,
+    controlnet_exists,
+    controlnet_type,
+    get_cn_models,
 )
-from modules import images, safe, script_callbacks, scripts, shared
+from modules import images, paths, script_callbacks, scripts, shared
 from modules.devices import NansException
-from modules.paths import data_path, models_path
 from modules.processing import (
     Processed,
     StableDiffusionProcessingImg2Img,
@@ -53,72 +67,29 @@ from modules.processing import (
 from modules.sd_samplers import all_samplers
 from modules.shared import cmd_opts, opts, state
 
+if TYPE_CHECKING:
+    from fastapi import FastAPI
+
+PARAMS_TXT = "params.txt"
+
 no_huggingface = getattr(cmd_opts, "ad_no_huggingface", False)
-adetailer_dir = Path(models_path, "adetailer")
+adetailer_dir = Path(paths.models_path, "adetailer")
+safe_mkdir(adetailer_dir)
+
 extra_models_dir = shared.opts.data.get("ad_extra_models_dir", "")
 model_mapping = get_models(
-    adetailer_dir, extra_dir=extra_models_dir, huggingface=not no_huggingface
+    adetailer_dir,
+    extra_models_dir,
+    huggingface=not no_huggingface,
 )
-txt2img_submit_button = img2img_submit_button = None
-SCRIPT_DEFAULT = "dynamic_prompting,dynamic_thresholding,wildcard_recursive,wildcards,lora_block_weight,negpip"
 
-if (
-    not adetailer_dir.exists()
-    and adetailer_dir.parent.exists()
-    and os.access(adetailer_dir.parent, os.W_OK)
-):
-    adetailer_dir.mkdir()
+txt2img_submit_button = img2img_submit_button = None
+txt2img_submit_button = cast(gr.Button, txt2img_submit_button)
+img2img_submit_button = cast(gr.Button, img2img_submit_button)
 
 print(
     f"[-] ADetailer initialized. version: {__version__}, num models: {len(model_mapping)}"
 )
-
-
-@contextmanager
-def change_torch_load():
-    orig = torch.load
-    try:
-        torch.load = safe.unsafe_torch_load
-        yield
-    finally:
-        torch.load = orig
-
-
-@contextmanager
-def pause_total_tqdm():
-    orig = opts.data.get("multiple_tqdm", True)
-    try:
-        opts.data["multiple_tqdm"] = False
-        yield
-    finally:
-        opts.data["multiple_tqdm"] = orig
-
-
-@contextmanager
-def preseve_prompts(p):
-    all_pt = copy(p.all_prompts)
-    all_ng = copy(p.all_negative_prompts)
-    try:
-        yield
-    finally:
-        p.all_prompts = all_pt
-        p.all_negative_prompts = all_ng
-
-
-@contextmanager
-def change_skip_img2img_args(p):
-    if not hasattr(p, "_ad_skip_img2img") or not p._ad_skip_img2img:
-        yield
-    else:
-        steps = p.steps
-        sampler_name = p.sampler_name
-        try:
-            p.steps = p._ad_orig_steps
-            p.sampler_name = p._ad_orig_sampler_name
-            yield
-        finally:
-            p.steps = steps
-            p.sampler_name = sampler_name
 
 
 class AfterDetailerScript(scripts.Script):
@@ -141,6 +112,7 @@ class AfterDetailerScript(scripts.Script):
         num_models = opts.data.get("ad_max_models", 2)
         ad_model_list = list(model_mapping.keys())
         sampler_names = [sampler.name for sampler in all_samplers]
+        scheduler_names = [x.label for x in schedulers]
 
         try:
             checkpoint_list = modules.sd_models.checkpoint_tiles(use_shorts=True)
@@ -151,6 +123,7 @@ class AfterDetailerScript(scripts.Script):
         webui_info = WebuiInfo(
             ad_model_list=ad_model_list,
             sampler_names=sampler_names,
+            scheduler_names=scheduler_names,
             t2i_button=txt2img_submit_button,
             i2i_button=img2img_submit_button,
             checkpoints_list=checkpoint_list,
@@ -210,7 +183,7 @@ class AfterDetailerScript(scripts.Script):
         not_none = any(arg.get("ad_model", "None") != "None" for arg in arg_list)
         return ad_enabled and not_none
 
-    def check_skip_img2img(self, p, *args_) -> None:
+    def set_skip_img2img(self, p, *args_) -> None:
         if (
             hasattr(p, "_ad_skip_img2img")
             or not hasattr(p, "init_images")
@@ -220,20 +193,28 @@ class AfterDetailerScript(scripts.Script):
 
         if len(args_) >= 2 and isinstance(args_[1], bool):
             p._ad_skip_img2img = args_[1]
-            if args_[1]:
-                p._ad_orig_steps = p.steps
-                p._ad_orig_sampler_name = p.sampler_name
-                p.steps = 1
-                p.sampler_name = "Euler"
         else:
             p._ad_skip_img2img = False
 
-    @staticmethod
-    def get_i(p) -> int:
-        it = p.iteration
-        bs = p.batch_size
-        i = p.batch_index
-        return it * bs + i
+        if not p._ad_skip_img2img:
+            return
+
+        if is_img2img_inpaint(p):
+            p._ad_disabled = True
+            msg = "[-] ADetailer: img2img inpainting with skip img2img is not supported. (because it's buggy)"
+            print(msg)
+            return
+
+        p._ad_orig = SkipImg2ImgOrig(
+            steps=p.steps,
+            sampler_name=p.sampler_name,
+            width=p.width,
+            height=p.height,
+        )
+        p.steps = 1
+        p.sampler_name = "Euler"
+        p.width = 128
+        p.height = 128
 
     def get_args(self, p, *args_) -> list[ADetailerArgs]:
         """
@@ -254,15 +235,12 @@ class AfterDetailerScript(scripts.Script):
             try:
                 inp = ADetailerArgs(**arg_dict)
             except ValueError as e:
-                msgs = [
-                    f"[-] ADetailer: ValidationError when validating {ordinal(n)} arguments: {e}\n"
-                ]
-                for attr in ALL_ARGS.attrs:
-                    arg = arg_dict.get(attr)
-                    dtype = type(arg)
-                    arg = "DEFAULT" if arg is None else repr(arg)
-                    msgs.append(f"    {attr}: {arg} ({dtype})")
-                raise ValueError("\n".join(msgs)) from e
+                msg = f"[-] ADetailer: ValidationError when validating {ordinal(n)} arguments"
+                if hasattr(e, "add_note"):
+                    e.add_note(msg)
+                else:
+                    print(msg, file=sys.stderr)
+                raise
 
             all_inputs.append(inp)
 
@@ -313,29 +291,35 @@ class AfterDetailerScript(scripts.Script):
             if not prompts[n]:
                 prompts[n] = blank_replacement
             elif "[PROMPT]" in prompts[n]:
-                prompts[n] = prompts[n].replace("[PROMPT]", f" {blank_replacement} ")
+                prompts[n] = prompts[n].replace("[PROMPT]", blank_replacement)
 
             for pair in replacements:
                 prompts[n] = prompts[n].replace(pair.s, pair.r)
         return prompts
 
     def get_prompt(self, p, args: ADetailerArgs) -> tuple[list[str], list[str]]:
-        i = self.get_i(p)
+        i = get_i(p)
         prompt_sr = p._ad_xyz_prompt_sr if hasattr(p, "_ad_xyz_prompt_sr") else []
 
-        prompt = self._get_prompt(args.ad_prompt, p.all_prompts, i, p.prompt, prompt_sr)
+        prompt = self._get_prompt(
+            ad_prompt=args.ad_prompt,
+            all_prompts=p.all_prompts,
+            i=i,
+            default=p.prompt,
+            replacements=prompt_sr,
+        )
         negative_prompt = self._get_prompt(
-            args.ad_negative_prompt,
-            p.all_negative_prompts,
-            i,
-            p.negative_prompt,
-            prompt_sr,
+            ad_prompt=args.ad_negative_prompt,
+            all_prompts=p.all_negative_prompts,
+            i=i,
+            default=p.negative_prompt,
+            replacements=prompt_sr,
         )
 
         return prompt, negative_prompt
 
     def get_seed(self, p) -> tuple[int, int]:
-        i = self.get_i(p)
+        i = get_i(p)
 
         if not p.all_seeds:
             seed = p.seed
@@ -359,6 +343,9 @@ class AfterDetailerScript(scripts.Script):
         if args.ad_use_inpaint_width_height:
             width = args.ad_inpaint_width
             height = args.ad_inpaint_height
+        elif hasattr(p, "_ad_orig"):
+            width = p._ad_orig.width
+            height = p._ad_orig.height
         else:
             width = p.width
             height = p.height
@@ -368,8 +355,8 @@ class AfterDetailerScript(scripts.Script):
     def get_steps(self, p, args: ADetailerArgs) -> int:
         if args.ad_use_steps:
             return args.ad_steps
-        if hasattr(p, "_ad_orig_steps"):
-            return p._ad_orig_steps
+        if hasattr(p, "_ad_orig"):
+            return p._ad_orig.steps
         return p.steps
 
     def get_cfg_scale(self, p, args: ADetailerArgs) -> float:
@@ -378,9 +365,20 @@ class AfterDetailerScript(scripts.Script):
     def get_sampler(self, p, args: ADetailerArgs) -> str:
         if args.ad_use_sampler:
             return args.ad_sampler
-        if hasattr(p, "_ad_orig_sampler_name"):
-            return p._ad_orig_sampler_name
+        if hasattr(p, "_ad_orig"):
+            return p._ad_orig.sampler_name
         return p.sampler_name
+
+    def get_scheduler(self, p, args: ADetailerArgs) -> dict[str, str]:
+        "webui >= 1.9.0"
+        if not args.ad_use_sampler:
+            return {}
+
+        if args.ad_scheduler == "Use same scheduler":
+            value = getattr(p, "scheduler", "Automatic")
+        else:
+            value = args.ad_scheduler
+        return {"scheduler": value}
 
     def get_override_settings(self, p, args: ADetailerArgs) -> dict[str, Any]:
         d = {}
@@ -412,23 +410,32 @@ class AfterDetailerScript(scripts.Script):
             p, p.all_prompts, p.all_seeds, p.all_subseeds, None, 0, 0
         )
 
-    def write_params_txt(self, p) -> None:
-        i = self.get_i(p)
-        lenp = len(p.all_prompts)
-        if i % lenp != lenp - 1:
-            return
+    def read_params_txt(self) -> str:
+        params_txt = Path(paths.data_path, PARAMS_TXT)
+        if params_txt.exists():
+            return params_txt.read_text(encoding="utf-8")
+        return ""
 
-        with change_skip_img2img_args(p):
-            infotext = self.infotext(p)
+    def write_params_txt(self, content: str) -> None:
+        params_txt = Path(paths.data_path, PARAMS_TXT)
+        if params_txt.exists() and content:
+            params_txt.write_text(content, encoding="utf-8")
 
-        params_txt = Path(data_path, "params.txt")
-        with suppress(Exception):
-            params_txt.write_text(infotext, encoding="utf-8")
+    @staticmethod
+    def script_args_copy(script_args):
+        type_: type[list] | type[tuple] = type(script_args)
+        result = []
+        for arg in script_args:
+            try:
+                a = copy(arg)
+            except TypeError:
+                a = arg
+            result.append(a)
+        return type_(result)
 
     def script_filter(self, p, args: ADetailerArgs):
         script_runner = copy(p.scripts)
-        script_args = deepcopy(p.script_args)
-        self.disable_controlnet_units(script_args)
+        script_args = self.script_args_copy(p.script_args)
 
         ad_only_seleted_scripts = opts.data.get("ad_only_seleted_scripts", True)
         if not ad_only_seleted_scripts:
@@ -454,7 +461,9 @@ class AfterDetailerScript(scripts.Script):
         script_runner.alwayson_scripts = filtered_alwayson
         return script_runner, script_args
 
-    def disable_controlnet_units(self, script_args: list[Any]) -> None:
+    def disable_controlnet_units(
+        self, script_args: list[Any] | tuple[Any, ...]
+    ) -> None:
         for obj in script_args:
             if "controlnet" in obj.__class__.__name__.lower():
                 if hasattr(obj, "enabled"):
@@ -473,6 +482,10 @@ class AfterDetailerScript(scripts.Script):
         initial_noise_multiplier = self.get_initial_noise_multiplier(p, args)
         sampler_name = self.get_sampler(p, args)
         override_settings = self.get_override_settings(p, args)
+
+        version_args = {}
+        if schedulers:
+            version_args.update(self.get_scheduler(p, args))
 
         i2i = StableDiffusionProcessingImg2Img(
             init_images=[image],
@@ -505,10 +518,11 @@ class AfterDetailerScript(scripts.Script):
             height=height,
             restore_faces=args.ad_restore_face,
             tiling=p.tiling,
-            extra_generation_params=p.extra_generation_params,
+            extra_generation_params=copy_extra_params(p.extra_generation_params),
             do_not_save_samples=True,
             do_not_save_grid=True,
             override_settings=override_settings,
+            **version_args,
         )
         
         i2i._ad_idx = p._ad_idx
@@ -518,15 +532,18 @@ class AfterDetailerScript(scripts.Script):
         i2i._ad_disabled = True
         i2i._ad_inner = True
 
-        if args.ad_controlnet_model != "None":
+        if args.ad_controlnet_model != "Passthrough" and controlnet_type != "forge":
+            self.disable_controlnet_units(i2i.script_args)
+
+        if args.ad_controlnet_model not in ["None", "Passthrough"]:
             self.update_controlnet_args(i2i, args)
-        else:
+        elif args.ad_controlnet_model == "None":
             i2i.control_net_enabled = False
 
         return i2i
 
     def save_image(self, p, image, *, condition: str, suffix: str) -> None:
-        i = self.get_i(p)
+        i = get_i(p)
         if p.all_prompts:
             i %= len(p.all_prompts)
             save_prompt = p.all_prompts[i]
@@ -558,13 +575,13 @@ class AfterDetailerScript(scripts.Script):
         sortby_idx = BBOX_SORTBY.index(sortby)
         return sort_bboxes(pred, sortby_idx)
 
-    def pred_preprocessing(self, pred: PredictOutput, args: ADetailerArgs):
+    def pred_preprocessing(self, p, pred: PredictOutput, args: ADetailerArgs):
         pred = filter_by_ratio(
             pred, low=args.ad_mask_min_ratio, high=args.ad_mask_max_ratio
         )
         pred = filter_k_largest(pred, k=args.ad_mask_k_largest)
         pred = self.sort_bboxes(pred)
-        return mask_preprocess(
+        masks = mask_preprocess(
             pred.masks,
             kernel=args.ad_dilate_erode,
             x_offset=args.ad_x_offset,
@@ -572,13 +589,10 @@ class AfterDetailerScript(scripts.Script):
             merge_invert=args.ad_mask_merge_invert,
         )
 
-    @staticmethod
-    def ensure_rgb_image(image: Any):
-        if not isinstance(image, Image.Image):
-            image = to_pil_image(image)
-        if image.mode != "RGB":
-            image = image.convert("RGB")
-        return image
+        if is_img2img_inpaint(p) and not is_inpaint_only_masked(p):
+            image_mask = self.get_image_mask(p)
+            masks = self.inpaint_mask_filter(image_mask, masks)
+        return masks
 
     @staticmethod
     def i2i_prompts_replace(
@@ -592,30 +606,23 @@ class AfterDetailerScript(scripts.Script):
         i2i.negative_prompt = negative_prompt
 
     @staticmethod
-    def compare_prompt(p, processed, n: int = 0):
-        if p.prompt != processed.all_prompts[0]:
+    def compare_prompt(p, extra_params: dict[str, Any], processed, n: int = 0):
+        if not hasattr(p, "_ad_extra_params_result"):
+            p._ad_extra_params_result = {}
+
+        pt = "ADetailer prompt" + suffix(n)
+        if pt in extra_params and extra_params[pt] != processed.all_prompts[0]:
             print(
                 f"[-] ADetailer: applied {ordinal(n + 1)} ad_prompt: {processed.all_prompts[0]!r}"
             )
+            p._ad_extra_params_result[pt] = processed.all_prompts[0]
 
-        if p.negative_prompt != processed.all_negative_prompts[0]:
+        ng = "ADetailer negative prompt" + suffix(n)
+        if ng in extra_params and extra_params[ng] != processed.all_negative_prompts[0]:
             print(
                 f"[-] ADetailer: applied {ordinal(n + 1)} ad_negative_prompt: {processed.all_negative_prompts[0]!r}"
             )
-
-    @staticmethod
-    def need_call_process(p) -> bool:
-        if p.scripts is None:
-            return False
-        i = p.batch_index
-        bs = p.batch_size
-        return i == bs - 1
-
-    @staticmethod
-    def need_call_postprocess(p) -> bool:
-        if p.scripts is None:
-            return False
-        return p.batch_index == 0
+            p._ad_extra_params_result[ng] = processed.all_negative_prompts[0]
 
     @staticmethod
     def get_i2i_init_image(p, pp):
@@ -628,18 +635,64 @@ class AfterDetailerScript(scripts.Script):
         use_same_seed = shared.opts.data.get("ad_same_seed_for_each_tap", False)
         return seed if use_same_seed else seed + i
 
+    @staticmethod
+    def inpaint_mask_filter(
+        img2img_mask: Image.Image, ad_mask: list[Image.Image]
+    ) -> list[Image.Image]:
+        if ad_mask and img2img_mask.size != ad_mask[0].size:
+            img2img_mask = img2img_mask.resize(ad_mask[0].size, resample=images.LANCZOS)
+        return [mask for mask in ad_mask if has_intersection(img2img_mask, mask)]
+
+    @staticmethod
+    def get_image_mask(p) -> Image.Image:
+        mask = p.image_mask
+        if getattr(p, "inpainting_mask_invert", False):
+            mask = ImageChops.invert(mask)
+        mask = create_binary_mask(mask)
+
+        if getattr(p, "_ad_skip_img2img", False):
+            if hasattr(p, "init_images") and p.init_images:
+                width, height = p.init_images[0].size
+            else:
+                msg = "[-] ADetailer: no init_images."
+                raise RuntimeError(msg)
+        else:
+            width, height = p.width, p.height
+        return images.resize_image(p.resize_mode, mask, width, height)
+
     @rich_traceback
     def process(self, p, *args_):
         if getattr(p, "_ad_disabled", False):
             return
 
-        if self.is_ad_enabled(*args_):
-            arg_list = self.get_args(p, *args_)
-            self.check_skip_img2img(p, *args_)
-            extra_params = self.extra_params(arg_list)
-            p.extra_generation_params.update(extra_params)
-        else:
+        if is_img2img_inpaint(p) and is_all_black(self.get_image_mask(p)):
             p._ad_disabled = True
+            msg = (
+                "[-] ADetailer: img2img inpainting with no mask -- adetailer disabled."
+            )
+            print(msg)
+            return
+
+        if not self.is_ad_enabled(*args_):
+            p._ad_disabled = True
+            return
+
+        self.set_skip_img2img(p, *args_)
+        if getattr(p, "_ad_disabled", False):
+            # case when img2img inpainting with skip img2img
+            return
+
+        arg_list = self.get_args(p, *args_)
+
+        if hasattr(p, "_ad_xyz_prompt_sr"):
+            replaced_positive_prompt, replaced_negative_prompt = self.get_prompt(
+                p, arg_list[0]
+            )
+            arg_list[0].ad_prompt = replaced_positive_prompt[0]
+            arg_list[0].ad_negative_prompt = replaced_negative_prompt[0]
+
+        extra_params = self.extra_params(arg_list)
+        p.extra_generation_params.update(extra_params)
 
     def _postprocess_image_inner(
         self, p, pp, args: ADetailerArgs, *, n: int = 0
@@ -654,7 +707,7 @@ class AfterDetailerScript(scripts.Script):
         if state.interrupted or state.skipped:
             return False
 
-        i = self.get_i(p)
+        i = get_i(p)
 
         i2i = self.get_i2i_p(p, args, pp.image)
         seed, subseed = self.get_seed(p)
@@ -670,18 +723,19 @@ class AfterDetailerScript(scripts.Script):
             predictor = ultralytics_predict
             ad_model = self.get_ad_model(args.ad_model)
             kwargs["device"] = self.ultralytics_device
+            kwargs["classes"] = args.ad_model_classes
 
         with change_torch_load():
             pred = predictor(ad_model, pp.image, args.ad_confidence, **kwargs)
 
-        masks = self.pred_preprocessing(pred, args)
-        shared.state.assign_current_image(pred.preview)
-
-        if not masks:
+        if pred.preview is None:
             print(
                 f"[-] ADetailer: nothing detected on image {i + 1} with {ordinal(n + 1)} settings."
             )
             return False
+
+        masks = self.pred_preprocessing(p, pred, args)
+        shared.state.assign_current_image(pred.preview)
 
         self.save_image(
             p,
@@ -700,7 +754,7 @@ class AfterDetailerScript(scripts.Script):
         p2 = copy(i2i)
         for j in range(steps):
             p2.image_mask = masks[j]
-            p2.init_images[0] = self.ensure_rgb_image(p2.init_images[0])
+            p2.init_images[0] = ensure_pil_image(p2.init_images[0], "RGB")
             self.i2i_prompts_replace(p2, ad_prompts, ad_negatives, j)
 
             if re.match(r"^\s*\[SKIP\]\s*$", p2.prompt):
@@ -718,7 +772,7 @@ class AfterDetailerScript(scripts.Script):
             finally:
                 p2.close()
 
-            self.compare_prompt(p2, processed, n=n)
+            self.compare_prompt(p, p.extra_generation_params, processed, n=n)
             p2 = copy(i2i)
             p2.init_images = [processed.images[0]]
 
@@ -734,11 +788,12 @@ class AfterDetailerScript(scripts.Script):
             return
 
         pp.image = self.get_i2i_init_image(p, pp)
-        pp.image = self.ensure_rgb_image(pp.image)
+        pp.image = ensure_pil_image(pp.image, "RGB")
         init_image = copy(pp.image)
         arg_list = self.get_args(p, *args_)
+        params_txt_content = self.read_params_txt()
 
-        if self.need_call_postprocess(p):
+        if need_call_postprocess(p):
             dummy = Processed(p, [], p.seed, "")
             with preseve_prompts(p):
                 p.scripts.postprocess(copy(p), dummy)
@@ -755,14 +810,17 @@ class AfterDetailerScript(scripts.Script):
                 p, init_image, condition="ad_save_images_before", suffix="-ad-before"
             )
 
-        if self.need_call_process(p):
+        if need_call_process(p):
             with preseve_prompts(p):
                 copy_p = copy(p)
                 if hasattr(p.scripts, "before_process"):
                     p.scripts.before_process(copy_p)
                 p.scripts.process(copy_p)
 
-        self.write_params_txt(p)
+        self.write_params_txt(params_txt_content)
+
+        if hasattr(p, "_ad_extra_params_result"):
+            p.extra_generation_params.update(p._ad_extra_params_result)
 
 
 def on_after_component(component, **_kwargs):
@@ -945,7 +1003,7 @@ def make_axis_on_xyz_grid():
             "[ADetailer] ControlNet model 1st",
             str,
             partial(set_value, field="ad_controlnet_model"),
-            choices=lambda: ["None", *get_cn_models()],
+            choices=lambda: ["None", "Passthrough", *get_cn_models()],
         ),
     ]
 
@@ -964,6 +1022,26 @@ def on_before_ui():
         )
 
 
+# api
+
+
+def add_api_endpoints(_: gr.Blocks, app: FastAPI):
+    @app.get("/adetailer/v1/version")
+    async def version():
+        return {"version": __version__}
+
+    @app.get("/adetailer/v1/schema")
+    async def schema():
+        if hasattr(ADetailerArgs, "model_json_schema"):
+            return ADetailerArgs.model_json_schema()
+        return ADetailerArgs.schema()
+
+    @app.get("/adetailer/v1/ad_model")
+    async def ad_model():
+        return {"ad_model": list(model_mapping)}
+
+
 script_callbacks.on_ui_settings(on_ui_settings)
 script_callbacks.on_after_component(on_after_component)
+script_callbacks.on_app_started(add_api_endpoints)
 script_callbacks.on_before_ui(on_before_ui)
